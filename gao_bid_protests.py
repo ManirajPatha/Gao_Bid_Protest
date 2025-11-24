@@ -1,20 +1,3 @@
-# gao_bid_protests.py
-# Pure Requests + BeautifulSoup version (no Selenium).
-# Outputs (unchanged):
-#   - goa_protest_file_upload.csv  (DB loader target)
-#   - gao_bid_protests.xlsx        (review workbook)
-#
-# Flags (unchanged + row limiter):
-#   --url --out-csv --out-xlsx --max-pages --upto
-#
-# Behavior:
-#   - Scrapes GAO search results.
-#   - For each product page, pulls "View Decision" expanded text by reading
-#     the <div data-readmore> content (no JS needed).
-#   - Saves after EVERY record (partial-save safety), and again on exit.
-#   - Handles GAO 403s via realistic headers, cookie warm-up, UA rotation,
-#     and optional cloudscraper fallback.
-
 import argparse
 import json
 import os
@@ -28,7 +11,6 @@ import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter, Retry
 
-# Optional anti-bot helper
 try:
     import cloudscraper
 except Exception:
@@ -39,8 +21,6 @@ SEARCH_URL_DEFAULT = (
     "&facets_query=&f%5B0%5D=ctype_search%3ABid%20Protest"
     "&f%5B1%5D=ctype_search%3ABid%20Protest%20Decision"
 )
-
-# --------------------- small utilities ---------------------
 
 def human_sleep(a: float = 0.35, b: float = 0.9) -> None:
     time.sleep(a + (b - a) * random.random())
@@ -120,8 +100,6 @@ def split_sections(full_text: str) -> Dict[str, str]:
         out[name] = body
     return out
 
-# --------------------- anti-bot session ---------------------
-
 _UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
@@ -133,11 +111,6 @@ def _rand_ua() -> str:
     return random.choice(_UAS)
 
 def build_session() -> requests.Session:
-    """
-    Build a session that looks like a real browser.
-    If cloudscraper is installed, use it; otherwise use requests with retries.
-    Also perform warm-up requests to seed cookies.
-    """
     if cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -153,7 +126,6 @@ def build_session() -> requests.Session:
         )
         s.mount("https://", HTTPAdapter(max_retries=retries))
         s.mount("http://", HTTPAdapter(max_retries=retries))
-
     ua = _rand_ua()
     s.headers.update({
         "User-Agent": ua,
@@ -167,24 +139,15 @@ def build_session() -> requests.Session:
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-User": "?1",
     })
-
-    # Warm-up: hit the root and search (cookie/anti-bot seeding)
     for warm in ["https://www.gao.gov/", "https://www.gao.gov/search"]:
         try:
             s.get(warm, timeout=30)
             time.sleep(0.6)
         except Exception:
             pass
-
     return s
 
 def get_html(session: requests.Session, url: str) -> Optional[BeautifulSoup]:
-    """
-    GET with 403 handling:
-      1) Try current session.
-      2) On 403, rotate UA + referer and retry.
-      3) On 403 again, rebuild session (maybe cloudscraper) and retry after warm-up.
-    """
     def _fetch(u: str) -> requests.Response:
         hdrs = {}
         if "/search" in u:
@@ -192,39 +155,30 @@ def get_html(session: requests.Session, url: str) -> Optional[BeautifulSoup]:
         elif "/products/" in u:
             hdrs["Referer"] = "https://www.gao.gov/search"
         return session.get(u, headers=hdrs, timeout=60)
-
     try:
         r = _fetch(url)
         if r.status_code == 200:
             return BeautifulSoup(r.text, "lxml")
-
         if r.status_code == 403:
             session.headers["User-Agent"] = _rand_ua()
             time.sleep(1.0)
             r2 = _fetch(url)
             if r2.status_code == 200:
                 return BeautifulSoup(r2.text, "lxml")
-
             new_session = build_session()
             time.sleep(1.0)
             r3 = new_session.get(url, timeout=60)
             if r3.status_code == 200:
-                # copy over session state for subsequent calls
                 session.cookies = new_session.cookies
                 session.headers.update(new_session.headers)
                 return BeautifulSoup(r3.text, "lxml")
-
             print(f"[WARN] GET {url} -> {r3.status_code} after rebuild")
             return None
-
         print(f"[WARN] GET {url} -> {r.status_code}")
         return None
-
     except Exception as e:
         print(f"[WARN] request failed {url}: {e}")
         return None
-
-# --------------------- parsing search page ---------------------
 
 def collect_result_links_from_page(soup: BeautifulSoup) -> List[str]:
     links: List[str] = []
@@ -251,8 +205,6 @@ def get_next_page(soup: BeautifulSoup) -> Optional[str]:
         href = "https://www.gao.gov" + href
     return href
 
-# --------------------- parsing product page ---------------------
-
 def get_title_file_date_from_doc(soup: BeautifulSoup) -> Tuple[str, str, str]:
     title = ""
     file_no = ""
@@ -273,20 +225,16 @@ def get_title_file_date_from_doc(soup: BeautifulSoup) -> Tuple[str, str, str]:
     return title, file_no, date
 
 def extract_expanded_decision_text(soup: BeautifulSoup) -> str:
-    # "Read more" is a CSS/JS toggle; full content exists in HTML.
     container = soup.select_one("div.field__item[data-readmore]") or soup.select_one("div[data-readmore]")
     if container:
         for br in container.find_all(["br"]):
             br.replace_with("\n")
         return container.get_text("\n", strip=True)
-
-    # Fallback: a field__item likely containing Decision
     for block in soup.select("div.field__item"):
         if block.find("p") and "Decision" in block.get_text(" ", strip=True)[:50]:
             for br in block.find_all(["br"]):
                 br.replace_with("\n")
             return block.get_text("\n", strip=True)
-
     return (soup.select_one("main") or soup).get_text("\n", strip=True)
 
 def scrape_item_with_bs(session: requests.Session, url: str) -> dict:
@@ -309,8 +257,6 @@ def scrape_item_with_bs(session: requests.Session, url: str) -> dict:
         "sections": sections,
     }
 
-# --------------------- writers (same shapes as Selenium version) ---------------------
-
 def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
     upload_rows = []
     for r in records:
@@ -330,15 +276,12 @@ def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
         }
         meta_json = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
         full_txt = sanitize_for_json(r.get("full_text", ""))
-
         upload_rows.append(
             {"protest_id": "", "file_metadata": meta_json, "file_content": full_txt}
         )
-
     upload_df = pd.DataFrame(upload_rows, columns=["protest_id", "file_metadata", "file_content"])
     upload_df.to_csv(out_csv, index=False, encoding="utf-8")
     print(f"[OK] DB-ready file written → {out_csv}  (rows: {len(upload_rows)})")
-
     if out_xlsx:
         KNOWN_ORDER_PREF = [
             "DIGEST", "BACKGROUND", "DISCUSSION", "DECISION", "CONCLUSION", "RECOMMENDATION"
@@ -346,7 +289,6 @@ def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
         meta_cols = ["file_number", "title", "date", "pdf_pages", "url"]
         rows = []
         sheet_map = []
-
         for idx, r in enumerate(records, 1):
             base = r["base"]
             row = {
@@ -359,7 +301,6 @@ def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
             secs = r.get("sections", {})
             for k in KNOWN_ORDER_PREF:
                 row[k] = sanitize_for_excel(secs.get(k, ""))
-
             sheet_name = re.sub(
                 r"[\\/*?:\[\]]",
                 "_",
@@ -371,10 +312,8 @@ def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
             )
             sheet_map.append((sheet_name, col_title, sanitize_for_excel(r.get("full_text", ""))))
             rows.append(row)
-
         master_cols = meta_cols + KNOWN_ORDER_PREF
         df = pd.DataFrame(rows, columns=master_cols)
-
         from openpyxl.styles import Alignment
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xlw:
             df.to_excel(xlw, sheet_name="Master", index=False)
@@ -393,7 +332,6 @@ def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
                         cell.alignment = Alignment(wrap_text=True, vertical="top")
                     else:
                         cell.alignment = Alignment(vertical="top")
-
             for sheet_name, col_title, text in sheet_map:
                 pd.DataFrame({col_title: [text]}).to_excel(xlw, sheet_name=sheet_name, index=False)
                 wsi = xlw.book[sheet_name]
@@ -401,10 +339,7 @@ def write_outputs(records: List[dict], out_csv: str, out_xlsx: str) -> None:
                 wsi.column_dimensions["A"].width = 120
                 if wsi.max_row >= 2:
                     wsi["A2"].alignment = Alignment(wrap_text=True, vertical="top")
-
         print(f"[OK] Review workbook written → {out_xlsx}  (items: {len(records)})")
-
-# --------------------- orchestrator ---------------------
 
 def run(search_url: str, out_csv: str, out_xlsx: str, max_pages: int, upto: int):
     session = build_session()
@@ -412,38 +347,30 @@ def run(search_url: str, out_csv: str, out_xlsx: str, max_pages: int, upto: int)
     processed = 0
     page_url = search_url
     page_num = 1
-
     try:
         while page_url:
             soup = get_html(session, page_url)
             if soup is None:
                 print(f"[WARN] Skipping page (no HTML): {page_url}")
                 break
-
             links = collect_result_links_from_page(soup)
             if not links:
                 print("[INFO] No product links found on page.")
                 break
-
             for url in links:
                 if upto and processed >= upto:
                     print(f"[INFO] Reached --upto limit ({upto}). Stopping.")
                     raise StopIteration
-
                 rec = scrape_item_with_bs(session, url)
                 records.append(rec)
                 processed += 1
-
-                # partial save after EVERY record
                 try:
                     write_outputs(records, out_csv, out_xlsx)
                 except PermissionError as pe:
                     print(f"[WARN] Excel locked, writing fallback: {pe}")
                     base, ext = os.path.splitext(out_xlsx)
                     write_outputs(records, out_csv, f"{base}_partial{ext}")
-
                 human_sleep()
-
             page_num += 1
             if max_pages and page_num > max_pages:
                 break
@@ -452,7 +379,6 @@ def run(search_url: str, out_csv: str, out_xlsx: str, max_pages: int, upto: int)
                 break
             page_url = nxt
             human_sleep(0.6, 1.2)
-
     except StopIteration:
         pass
     except KeyboardInterrupt:
@@ -460,15 +386,12 @@ def run(search_url: str, out_csv: str, out_xlsx: str, max_pages: int, upto: int)
     except Exception as e:
         print(f"[WARN] Unexpected error: {e}")
     finally:
-        # Final write to ensure latest data is saved
         try:
             write_outputs(records, out_csv, out_xlsx)
         except PermissionError as pe:
             print(f"[WARN] Final Excel write locked; writing fallback: {pe}")
             base, ext = os.path.splitext(out_xlsx)
             write_outputs(records, out_csv, f"{base}_partial{ext}")
-
-# --------------------- CLI ---------------------
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
@@ -477,10 +400,9 @@ if __name__ == "__main__":
     ap.add_argument("--url", default=SEARCH_URL_DEFAULT)
     ap.add_argument("--out-csv", default="goa_protest_file_upload.csv")
     ap.add_argument("--out-xlsx", default="gao_bid_protests.xlsx")
-    ap.add_argument("--max-pages", type=int, default=0)     # 0 = all pages
+    ap.add_argument("--max-pages", type=int, default=0)
     ap.add_argument("--upto", type=int, default=0, help="Stop after scraping N rows (0 = no limit)")
     args = ap.parse_args()
-
     run(
         search_url=args.url,
         out_csv=args.out_csv,
